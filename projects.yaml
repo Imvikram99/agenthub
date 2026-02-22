@@ -1,0 +1,101 @@
+# Hub Gateway — Project Registry
+# Add new projects here. Hub auto-discovers tools on startup.
+#
+# Types:
+#   api        — FastAPI/Flask app with HTTP endpoints
+#   cli        — Command-line tool run as subprocess
+#   subprocess — Long-running process launched in background
+
+projects:
+
+  langgraph-poc:
+    type: api
+    root: /Users/apple/Documents/vikram_workspace/mylanggraph/langgraph-poc
+    url: http://localhost:8000
+    port: 8000
+    venv: .venv
+    description: >
+      AI coding workflow engine. Handles feature requests, bug fixes,
+      refactoring, architecture work, deployment, and PR creation.
+      Use this when the user wants to make code changes to any repository.
+    discovery:
+      method: manual
+      endpoints:
+        - path: /run
+          method: POST
+          tool_name: langgraph_run
+          description: "Execute a coding workflow — features, bugs, refactoring, architecture"
+          params:
+            prompt: {type: string, required: true, description: "User request for code changes"}
+            repo: {type: string, description: "Optional target repository path"}
+            workflow_mode: {type: string, enum: [full, backendonly, frontendonly, planning], description: "Workflow scope"}
+
+  salesy:
+    type: api
+    root: /Users/apple/Documents/vikram_workspace/mylanggraph/salesy
+    url: http://localhost:8001
+    port: 8001
+    venv: backend/.venv
+    description: >
+      Sales CRM and outreach platform. Manages leads, generates
+      AI-powered email outreach, handles approvals, social content,
+      proposals, and campaign sequences.
+    discovery:
+      method: scan_routes
+      entry_file: backend/app/main.py
+      default_headers:
+        Content-Type: application/json
+        X-Tenant-Id: default
+        X-User-Roles: operator,admin
+      # Manual overrides for complex tools that auto-discovery can't handle well
+      manual_tools:
+        - name: salesy_generate_drafts
+          endpoint: POST /api/v1/outreach/drafts:generate
+          description: "Generate AI-powered outreach email drafts for a lead"
+          params:
+            lead_id: {type: string, required: true}
+            channels: {type: array, items: {type: string, enum: [email, whatsapp, linkedin]}}
+            prompt: {type: string, description: "Custom draft instructions"}
+            variants: {type: integer, description: "Number of variants"}
+
+  rothchild:
+    type: cli
+    root: /Users/apple/Documents/vikram_workspace/mylanggraph/rothchild
+    venv: .venv
+    description: >
+      Investment portfolio advisor. Runs portfolio analysis, thesis evaluation,
+      crash detection, drift alerts, and rebalancing recommendations.
+    discovery:
+      method: manual
+      commands:
+        - name: rothchild_run
+          script: "-m src.runner"
+          description: "Run advisor with default sample portfolio"
+          args:
+            cadence: {type: string, enum: [daily, weekly, monthly, quarterly], description: "Report cadence"}
+            dry-run: {type: boolean, flag: true, description: "Show what would run without executing"}
+        - name: rothchild_run_portfolio
+          script: "run_sample.py"
+          description: "Run advisor against a specific portfolio CSV"
+          args:
+            portfolio: {type: string, required: true, description: "Path to portfolio CSV file"}
+    # Extra tools that need custom logic (can't be auto-generated from CLI)
+    custom_tools:
+      - name: rothchild_create_portfolio
+        description: "Create portfolio CSV from natural language holdings"
+        params:
+          holdings:
+            type: array
+            required: true
+            description: "List of stock holdings"
+            items:
+              symbol: {type: string, required: true}
+              exchange: {type: string, enum: [NSE, BSE, NYSE, NASDAQ, NYSEARCA]}
+              quantity: {type: number, required: true}
+              avg_cost: {type: number, default: 0}
+              current_price: {type: number, default: 0}
+              buy_date: {type: string}
+          portfolio_name: {type: string}
+      - name: rothchild_read_log
+        description: "Read the latest run log to get analysis results"
+        params: {}
