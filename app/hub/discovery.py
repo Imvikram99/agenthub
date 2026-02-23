@@ -69,6 +69,7 @@ def scan_routes(entry_file: str) -> List[Dict[str, Any]]:
             "path_params": path_params,
             "tool_name": tool_name,
             "description": description,
+            "is_hazardous": method in ("POST", "PUT", "PATCH", "DELETE")
         })
 
     logger.info(f"Discovered {len(endpoints)} endpoints in {entry_file}")
@@ -83,7 +84,6 @@ def fetch_openapi(url: str, headers: Optional[Dict[str, str]] = None) -> List[Di
     openapi_url = url.rstrip("/")
     if not openapi_url.endswith("/openapi.json"):
         # Most FastAPI apps have it here by default.
-        # Could also check /api-docs or /swagger.json for other frameworks.
         openapi_url = f"{openapi_url}/openapi.json"
 
     logger.info(f"Fetching OpenAPI spec from {openapi_url}")
@@ -185,7 +185,8 @@ def fetch_openapi(url: str, headers: Optional[Dict[str, str]] = None) -> List[Di
                 "path_params": path_params,
                 "tool_name": tool_name,
                 "description": summary or desc,
-                "manual_params": combined_params if combined_params else None
+                "manual_params": combined_params if combined_params else None,
+                "is_hazardous": method_upper in ("POST", "PUT", "PATCH", "DELETE")
             })
 
     logger.info(f"Discovered {len(endpoints)} OpenAPI endpoints from {url}")
@@ -317,6 +318,7 @@ def endpoint_to_tool(
             "method": endpoint["method"],
             "path": endpoint["path"],
             "path_params": endpoint.get("path_params", []),
+            "is_hazardous": endpoint.get("is_hazardous", False),
         },
     }
 

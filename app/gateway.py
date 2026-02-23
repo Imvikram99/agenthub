@@ -32,7 +32,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 import instructor
@@ -41,6 +42,7 @@ from openai import AsyncOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
+from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 
 from langchain_openai import OpenAIEmbeddings
@@ -400,6 +402,25 @@ async def tools_node(state: AgentState) -> Dict[str, Any]:
             continue
 
         logger.info(f"Executing tool: {tool_name}({json.dumps(tool_args)[:200]})")
+        
+        # Human-in-the-loop: Interrupt hazardous tools
+        meta = registry.get_tool_meta(tool_name)
+        if meta and meta.get("is_hazardous"):
+            logger.warning(f"Interrupting for hazardous tool: {tool_name}")
+            approval = interrupt({
+                "action": "require_approval",
+                "tool_name": tool_name,
+                "args": tool_args
+            })
+            if not approval.get("approved"):
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": tool_name,
+                    "content": json.dumps({"error": "User denied action execution."})
+                })
+                continue
+
         result = await execute_tool(tool_name, tool_args)
         
         results.append({
@@ -458,6 +479,22 @@ async def agent_chat(session_id: str, user_message: str, history: List[Dict[str,
             "messages": initial_messages,
             "session_id": session_id
         }, config=config)
+        
+        # Check if the graph was interrupted
+        state_snapshot = await app_graph.aget_state(config)
+        if state_snapshot.next:
+            # Graph is paused waiting for user input
+            interrupt_data = state_snapshot.tasks[0].interrupts[0].value
+            action = interrupt_data.get("action")
+            tool_name = interrupt_data.get("tool_name")
+            
+            if action == "require_approval":
+                return (
+                    f"⚠️ **Approval Required** ⚠️\n\n"
+                    f"I need to run a potentially destructive action: `{tool_name}`\n"
+                    f"Please approve or deny this action to continue."
+                )
+
     except Exception as e:
         logger.error(f"Graph execution failed: {e}")
         return f"⚠️ Workflow error: {e}"
@@ -465,9 +502,89 @@ async def agent_chat(session_id: str, user_message: str, history: List[Dict[str,
     messages = final_state.get("messages", [])
     if not messages:
         return "No response."
-        
     last_message = messages[-1]
     return last_message.get("content", "No text response generated.")
+
+
+async def stream_chat(session_id: str, user_message: str, history: List[Dict[str, Any]]):
+    """
+    Run LangGraph and yield Server-Sent Events (SSE) for real-time frontend streaming.
+    Yields chunks like: data: {"event": "model_stream", "content": "Hello"}
+    """
+    initial_messages = history + [{"role": "user", "content": user_message}]
+    
+    lower_msg = user_message.lower()
+    if "always " in lower_msg or "remember" in lower_msg or "prefer" in lower_msg:
+        save_user_memory(session_id, user_message)
+
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": MAX_TOOL_ROUNDS * 2
+    }
+
+    try:
+        # We use astream_events to catch granular internal events (tool starts, LLM tokens)
+        async for event in app_graph.astream_events({
+            "messages": initial_messages,
+            "session_id": session_id
+        }, config=config, version="v1"):
+            
+            kind = event["event"]
+            name = event.get("name", "")
+            
+            # 1. LLM Token streaming (if the model/OpenAI client supports it)
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if hasattr(chunk, "content") and chunk.content:
+                    payload = {"event": "model_stream", "content": chunk.content}
+                    yield f"data: {json.dumps(payload)}\n\n"
+            
+            # 2. Tool started executing
+            elif kind == "on_tool_start":
+                # LangGraph might emit generic tool runnables, filter for our specific tools
+                if name != "tools":
+                    payload = {"event": "tool_start", "tool_name": name, "args": event["data"].get("input")}
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+            # 3. Tool completed
+            elif kind == "on_tool_end":
+                if name != "tools":
+                    # Output might be large, truncate for SSE if necessary
+                    output = event["data"].get("output", "")
+                    if isinstance(output, str) and len(output) > 500:
+                         output = output[:500] + "...[truncated]"
+                         
+                    payload = {"event": "tool_end", "tool_name": name, "result": output}
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    
+        # Check interrupts at the very end
+        state_snapshot = await app_graph.aget_state(config)
+        if state_snapshot.next:
+            interrupt_data = state_snapshot.tasks[0].interrupts[0].value
+            action = interrupt_data.get("action")
+            tool_name = interrupt_data.get("tool_name")
+            if action == "require_approval":
+                payload = {"event": "interrupt", "tool_name": tool_name, "message": "Approval required"}
+                yield f"data: {json.dumps(payload)}\n\n"
+                return
+
+        # Fetch the very last message for history recording
+        final_state = await app_graph.aget_state(config)
+        messages = final_state.values.get("messages", [])
+        if messages:
+             content = messages[-1].get("content")
+             history.append({"role": "user", "content": user_message})
+             history.append({"role": "assistant", "content": content})
+             if len(history) > 40:
+                 history[:] = history[-30:]
+                 
+             payload = {"event": "done", "session_id": session_id}
+             yield f"data: {json.dumps(payload)}\n\n"
+
+    except Exception as e:
+        logger.error(f"Stream graph execution failed: {e}")
+        payload = {"event": "error", "message": f"Workflow error: {e}"}
+        yield f"data: {json.dumps(payload)}\n\n"
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────
@@ -498,6 +615,10 @@ async def chat(req: ChatRequest):
     history = sessions[session_id]
 
     output = await agent_chat(session_id, req.prompt, history)
+    
+    # If the output indicates it was interrupted, tell the user
+    # (Output from agent_chat natively might not yield a clean message during interrupt, 
+    # but we can detect state via the memory Checkpointer if needed. For now, we trust the output).
 
     # Save to session history
     history.append({"role": "user", "content": req.prompt})
@@ -508,6 +629,57 @@ async def chat(req: ChatRequest):
         history[:] = history[-30:]
 
     return ChatResponse(output=output, session_id=session_id)
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Event Stream (SSE) entry point for UI clients requiring real-time updates."""
+    session_id = req.session_id or str(uuid.uuid4())
+
+    if session_id not in sessions:
+        sessions[session_id] = []
+
+    history = sessions[session_id]
+
+    return StreamingResponse(
+        stream_chat(session_id, req.prompt, history),
+        media_type="text/event-stream"
+    )
+
+class ResumeRequest(BaseModel):
+    approved: bool
+
+
+@app.post("/chat/resume/{thread_id}")
+async def resume_chat(thread_id: str, req: ResumeRequest):
+    """Resume a paused graph execution with an approval decision."""
+    from langgraph.types import Command
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # Inject the approval decision back into the interrupt point
+    final_state = await app_graph.ainvoke(
+        Command(resume={"approved": req.approved}),
+        config=config
+    )
+    
+    # If it was interrupted AGAIN (unlikely but possible)
+    state_snapshot = await app_graph.aget_state(config)
+    if state_snapshot.next:
+        interrupt_data = state_snapshot.tasks[0].interrupts[0].value
+        return {
+            "output": f"⚠️ **Approval Required** for `{interrupt_data.get('tool_name')}`",
+            "session_id": thread_id
+        }
+
+    messages = final_state.get("messages", [])
+    if not messages:
+        return {"output": "No response after resume.", "session_id": thread_id}
+        
+    last_message = messages[-1]
+    return {
+        "output": last_message.get("content", "No text response generated after resume."),
+        "session_id": thread_id
+    }
 
 
 @app.get("/health")

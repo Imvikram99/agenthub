@@ -50,10 +50,23 @@ class Project:
         self.venv = config.get("venv", ".venv")
         self.description = config.get("description", "")
         self.discovery = config.get("discovery", {})
+        self.auth = config.get("auth", {})
         self.default_headers = self.discovery.get("default_headers", {})
         self.custom_tools_config = config.get("custom_tools", [])
         self.manual_tools_config = self.discovery.get("manual_tools", [])
         self.tools: List[Dict[str, Any]] = []
+
+    def get_auth_header(self) -> Dict[str, str]:
+        """Dynamically build the Authorizaton header from env token."""
+        auth_type = self.auth.get("type", "").lower()
+        env_var = self.auth.get("env")
+        if auth_type == "bearer" and env_var:
+            token = os.environ.get(env_var)
+            if token:
+                return {"Authorization": f"Bearer {token}"}
+            else:
+                logger.warning(f"[{self.name}] Missing token for env var: {env_var}")
+        return {}
 
     def discover(self) -> List[Dict[str, Any]]:
         """Run discovery and return tool schemas."""
@@ -69,7 +82,9 @@ class Project:
             logger.info(f"[{self.name}] scan_routes discovered {len(tools)} tools")
 
         elif method == "openapi":
-            endpoints = fetch_openapi(self.url, headers=self.default_headers)
+            # Pass our dynamically generated auth headers + default headers to discovery
+            headers = {**self.default_headers, **self.get_auth_header()}
+            endpoints = fetch_openapi(self.url, headers=headers)
             for ep in endpoints:
                 tool = endpoint_to_tool(self.name, ep)
                 tools.append(tool)
@@ -256,6 +271,7 @@ class ProjectRegistry:
                     "port": project.port,
                     "description": project.description,
                     "discovery": project.discovery,
+                    "auth": project.auth,
                 }
 
         with open(self.yaml_path, "w") as f:
@@ -389,7 +405,8 @@ If user just says "run analysis" without specifying holdings, use `rothchild_run
             if param in args:
                 path = path.replace(f"{{{param}}}", str(args.pop(param)))
 
-        headers = {**project.default_headers}
+        # Build final headers dynamically (default + auth)
+        headers = {**project.default_headers, **project.get_auth_header()}
 
         async with httpx.AsyncClient(
             base_url=project.url, timeout=120, headers=headers,
