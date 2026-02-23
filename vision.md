@@ -23,5 +23,8 @@ The Agent Hub is designed to be the central, intelligent nervous system connecti
 6. **Ironclad Output Guardrails**
    Execution must be safe. By wrapping LLM outputs in **Instructor** and strictly enforcing **Pydantic** typing, the Hub prevents hallucinated shell injections and blocks destructive absolute paths. The agent is powerful, but securely bounded.
 
+7. **Autonomous Multi-Agent Planning (CLI)**
+   Complex goals often require intelligent subdivision. By accepting input directly via a CLI (e.g. `python scripts/hub_cli.py "make techfounder tenant..."`), the Hub can route the prompt to a **Prompt Engineer/Upgrader Agent**. This agent expands the user's brief input into a comprehensive multi-step prompt, which is then passed to a **Planner Agent** to create a structured queue of sub-tasks. The LangGraph engine then steps through these tasks procedurally—running jobs, reflecting on output, and adapting until the overarching goal is met.
+
 ## The End State
 A conversational command center that requires zero manual wiring. Developers spin up new microservices, and the Agent Hub instantly discovers their capabilities, routes natural language requests to them safely, remembers user preferences effortlessly, and writes its own microservices when the existing ones fall short.
