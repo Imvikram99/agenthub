@@ -278,12 +278,14 @@ def validate_tool_arguments(tool_name: str, args: Dict[str, Any]) -> Dict[str, A
 
 # ── OpenRouter LLM Client ─────────────────────────────────────────────────────
 
-# We use the official OpenAI client patched with Instructor
+raw_client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+# We use the official OpenAI client patched with Instructor for structured planning
 client = instructor.from_openai(
-    AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-    ),
+    raw_client,
     mode=instructor.Mode.JSON
 )
 
@@ -301,9 +303,8 @@ async def call_llm(
         payload["tool_choice"] = "auto"
 
     # Use the standard wrapper instead of raw HTTPX to get proper tool calling schema support
-    # (Since we just want raw tool_calls out, we don't strictly *need* instructor.patch 
-    # to yield a Pydantic model here, but we use the patched OpenAI client for reliability)
-    response = await client.chat.completions.create(**payload)
+    # We use raw_client here because we want raw tool_calls out, not an Instructor Pydantic model
+    response = await raw_client.chat.completions.create(**payload)
     
     # Reconstruct the response dict to match the previous httpx format
     # so the rest of the LangGraph node logic doesn't break
