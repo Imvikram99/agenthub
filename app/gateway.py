@@ -33,11 +33,25 @@ import httpx
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+import instructor
+from openai import AsyncOpenAI
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+from langgraph.checkpoint.memory import MemorySaver
+
+from langchain_openai import OpenAIEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
 
 from app.hub.registry import ProjectRegistry
 
 load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("hub_gateway")
@@ -53,6 +67,71 @@ MAX_TOOL_ROUNDS = 8
 
 registry = ProjectRegistry()
 registry.load()
+
+
+# ── Qdrant Memory Setup ────────────────────────────────────────────────────────
+
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = "hub_user_memory"
+
+vector_store = None
+if OPENAI_API_KEY:
+    try:
+        _qdrant_client = QdrantClient(url=QDRANT_URL)
+        if not _qdrant_client.collection_exists(QDRANT_COLLECTION):
+            from qdrant_client.http.models import VectorParams, Distance
+            _qdrant_client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+            )
+        
+        # We use OpenAI's standard text-embedding-3-small via LangChain
+        _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        vector_store = QdrantVectorStore(
+            client=_qdrant_client,
+            collection_name=QDRANT_COLLECTION,
+            embedding=_embeddings,
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize Qdrant Vector Store: {e}")
+else:
+    logger.warning("OPENAI_API_KEY not set. Long Term Memory (Qdrant) is disabled.")
+
+def get_user_memory(session_id: str, query: str) -> str:
+    """Retrieve relevant memory facts for this session."""
+    if not vector_store:
+        return ""
+        
+    try:
+        # We filter explicitly by session_id in the payload metadata
+        docs = vector_store.similarity_search(
+            query=query,
+            k=3,
+            filter={"must": [{"key": "session_id", "match": {"value": session_id}}]}
+        )
+        if not docs:
+            return ""
+        
+        facts = "\n".join(f"- {d.page_content}" for d in docs)
+        return f"\n\nRelevant past instructions from this user:\n{facts}"
+    except Exception as e:
+        logger.error(f"Error querying memory: {e}")
+        return ""
+
+def save_user_memory(session_id: str, fact: str):
+    """Save a new explicit preference to Qdrant."""
+    if not vector_store:
+        return
+    try:
+        from langchain_core.documents import Document
+        doc = Document(
+            page_content=fact,
+            metadata={"session_id": session_id, "timestamp": datetime.datetime.now().isoformat()}
+        )
+        vector_store.add_documents([doc])
+        logger.info(f"Saved memory for session {session_id}: {fact}")
+    except Exception as e:
+        logger.error(f"Error saving memory: {e}")
 
 
 # ── Hub Evolve Meta-Tool ───────────────────────────────────────────────────────
@@ -172,13 +251,47 @@ async def execute_tool(name: str, args: dict) -> str:
     return await registry.execute_tool(name, args)
 
 
+# ── Output Structure & Guardrails (Instructor & Pydantic) ────────────────────
+
+class SafeToolCallParameter(BaseModel):
+    """
+    Pydantic model to enforce safe parameters for CLI/System tools.
+    Blocks absolute file paths and shell injections.
+    """
+    @classmethod
+    def validate_safe_arg(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            # Block obvious absolute path attempts that might traverse to system dirs
+            if v.startswith("/") and len(v) > 1 and not v.startswith("/Users/apple/Documents/vikram_workspace"):
+                raise ValueError(f"Forbidden absolute path outside workspace: {v}")
+            # Block basic subshell injections
+            if "$(" in v or "`" in v or "&" in v or "|" in v:
+                raise ValueError(f"Potentially unsafe shell characters in argument: {v}")
+        return v
+
+def validate_tool_arguments(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Validates arbitrary dictionary arguments against our safety rules."""
+    for k, v in args.items():
+        SafeToolCallParameter.validate_safe_arg(v)
+    return args
+
+
 # ── OpenRouter LLM Client ─────────────────────────────────────────────────────
+
+# We use the official OpenAI client patched with Instructor
+client = instructor.from_openai(
+    AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+    ),
+    mode=instructor.Mode.JSON
+)
 
 async def call_llm(
     messages: List[Dict[str, Any]],
     tools: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
-    """Call OpenRouter chat completions with function calling support."""
+    """Call OpenRouter using the native OpenAI SDK (Instructor compatible)."""
     payload: Dict[str, Any] = {
         "model": HUB_MODEL,
         "messages": messages,
@@ -187,77 +300,173 @@ async def call_llm(
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        if r.status_code != 200:
-            raise Exception(f"OpenRouter API error ({r.status_code}): {r.text}")
-        return r.json()
+    # Use the standard wrapper instead of raw HTTPX to get proper tool calling schema support
+    # (Since we just want raw tool_calls out, we don't strictly *need* instructor.patch 
+    # to yield a Pydantic model here, but we use the patched OpenAI client for reliability)
+    response = await client.chat.completions.create(**payload)
+    
+    # Reconstruct the response dict to match the previous httpx format
+    # so the rest of the LangGraph node logic doesn't break
+    message_dict = {"role": response.choices[0].message.role, "content": response.choices[0].message.content or ""}
+    
+    if response.choices[0].message.tool_calls:
+        message_dict["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                }
+            }
+            for tc in response.choices[0].message.tool_calls
+        ]
+        
+    return {
+        "choices": [
+            {
+                "message": message_dict
+            }
+        ]
+    }
 
 
-# ── Conversation Engine ───────────────────────────────────────────────────────
+# ── Conversation Engine (LangGraph) ──────────────────────────────────────────
 
-async def agent_chat(user_message: str, history: List[Dict[str, Any]]) -> str:
-    """
-    Run the agent loop:
-    1. Send user message + tools to LLM
-    2. If LLM wants to call tools → execute them, feed results back
-    3. Repeat until LLM returns a text response (or max rounds)
-    """
+class AgentState(TypedDict):
+    messages: List[Dict[str, Any]]
+    session_id: str
+
+
+async def agent_node(state: AgentState) -> Dict[str, Any]:
+    """Call the LLM with current state."""
+    messages = state["messages"]
+    session_id = state.get("session_id", "default")
+    
     system_prompt = get_system_prompt()
+    
+    # Retrieve relevant memories and inject them into the system prompt
+    last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    if last_user_msg:
+        memory_context = get_user_memory(session_id, last_user_msg)
+        system_prompt += memory_context
+
     tools = get_all_tools()
 
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
+    # Prepend system prompt if not present
+    if not messages or messages[0].get("role") != "system":
+        messages = [{"role": "system", "content": system_prompt}] + messages
 
-    for round_num in range(1, MAX_TOOL_ROUNDS + 1):
-        logger.info(f"LLM round {round_num}")
+    try:
+        response = await call_llm(messages, tools)
+    except Exception as e:
+        return {"messages": [{"role": "assistant", "content": f"❌ LLM API error: {e}"}]}
 
+    choice = response["choices"][0]
+    msg = choice["message"]
+    
+    return {"messages": [msg]}
+
+
+async def tools_node(state: AgentState) -> Dict[str, Any]:
+    """Execute tools requested by the LLM."""
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    tool_calls = last_message.get("tool_calls", [])
+    if not tool_calls:
+        return {"messages": []}
+
+    results = []
+    for tc in tool_calls:
+        fn = tc["function"]
+        tool_name = fn["name"]
         try:
-            response = await call_llm(messages, tools)
-        except Exception as e:
-            return f"❌ LLM API error: {e}"
-
-        choice = response["choices"][0]
-        msg = choice["message"]
-
-        # If LLM returns text (no tool calls), we're done
-        if msg.get("content") and not msg.get("tool_calls"):
-            return msg["content"]
-
-        # If LLM wants to call tools
-        if msg.get("tool_calls"):
-            messages.append(msg)  # assistant message with tool_calls
-
-            for tc in msg["tool_calls"]:
-                fn = tc["function"]
-                tool_name = fn["name"]
-                try:
-                    tool_args = json.loads(fn.get("arguments", "{}"))
-                except json.JSONDecodeError:
-                    tool_args = {}
-
-                logger.info(f"Executing tool: {tool_name}({json.dumps(tool_args)[:200]})")
-                result = await execute_tool(tool_name, tool_args)
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
+            tool_args = json.loads(fn.get("arguments", "{}"))
+            # Apply strict Pydantic safety validators
+            tool_args = validate_tool_arguments(tool_name, tool_args)
+        except json.JSONDecodeError:
+            tool_args = {}
+        except ValueError as ve:
+            # Catch Pydantic validation errors (unsafe paths, etc)
+            logger.warning(f"Validation blocked tool call to {tool_name}: {ve}")
+            results.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": tool_name,
+                "content": json.dumps({"error": f"Guardrail Validation Error: {ve}"})
+            })
             continue
 
-        # Fallback: return whatever content we got
-        return msg.get("content", "No response from LLM.")
+        logger.info(f"Executing tool: {tool_name}({json.dumps(tool_args)[:200]})")
+        result = await execute_tool(tool_name, tool_args)
+        
+        results.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": tool_name,
+            "content": result
+        })
+        
+    return {"messages": results}
 
-    return "⚠️ Reached maximum tool rounds. Please try a simpler request."
+
+def should_continue(state: AgentState) -> str:
+    """Determine whether to call tools or end."""
+    last_message = state["messages"][-1]
+    if last_message.get("tool_calls"):
+        return "tools"
+    return END
+
+# Build Graph
+memory = MemorySaver()
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tools_node)
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges("agent", should_continue)
+workflow.add_edge("tools", "agent")
+
+# Compile
+app_graph = workflow.compile(checkpointer=memory)
+
+
+async def agent_chat(session_id: str, user_message: str, history: List[Dict[str, Any]]) -> str:
+    """
+    Run the LangGraph workflow.
+    """
+    initial_messages = history + [{"role": "user", "content": user_message}]
+    
+    # Auto-extract explicit "remember this" or "always do X" instructions 
+    # and save them to the vector store
+    lower_msg = user_message.lower()
+    if "always " in lower_msg or "remember" in lower_msg or "prefer" in lower_msg:
+        # A simple heuristic; can be made smarter with LLM memory extraction
+        save_user_memory(session_id, user_message)
+    
+    # We pass recursion_limit equal to MAX_TOOL_ROUNDS + a little buffer
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": MAX_TOOL_ROUNDS * 2
+    }
+    
+    try:
+        # Run graph
+        # Note: we need to pass session_id into the state so the agent_node can use it for memory
+        final_state = await app_graph.ainvoke({
+            "messages": initial_messages,
+            "session_id": session_id
+        }, config=config)
+    except Exception as e:
+        logger.error(f"Graph execution failed: {e}")
+        return f"⚠️ Workflow error: {e}"
+        
+    messages = final_state.get("messages", [])
+    if not messages:
+        return "No response."
+        
+    last_message = messages[-1]
+    return last_message.get("content", "No text response generated.")
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────
@@ -287,7 +496,7 @@ async def chat(req: ChatRequest):
 
     history = sessions[session_id]
 
-    output = await agent_chat(req.prompt, history)
+    output = await agent_chat(session_id, req.prompt, history)
 
     # Save to session history
     history.append({"role": "user", "content": req.prompt})

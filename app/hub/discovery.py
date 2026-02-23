@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+
 logger = logging.getLogger("hub.discovery")
 
 
@@ -71,6 +73,127 @@ def scan_routes(entry_file: str) -> List[Dict[str, Any]]:
 
     logger.info(f"Discovered {len(endpoints)} endpoints in {entry_file}")
     return endpoints
+
+
+def fetch_openapi(url: str, headers: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch /openapi.json from a running service and convert it to discovered endpoints.
+    Requires httpx to make the network request.
+    """
+    openapi_url = url.rstrip("/")
+    if not openapi_url.endswith("/openapi.json"):
+        # Most FastAPI apps have it here by default.
+        # Could also check /api-docs or /swagger.json for other frameworks.
+        openapi_url = f"{openapi_url}/openapi.json"
+
+    logger.info(f"Fetching OpenAPI spec from {openapi_url}")
+    
+    try:
+        # We do this synchronously since discovery happens at startup/register time
+        # Currently the registry doesn't use async for discovery.
+        with httpx.Client(timeout=10.0, headers=headers) as client:
+            resp = client.get(openapi_url)
+            resp.raise_for_status()
+            spec = resp.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch OpenAPI from {openapi_url}: {e}")
+        return []
+
+    endpoints = []
+    paths = spec.get("paths", {})
+    
+    for path, path_item in paths.items():
+        for method, operation in path_item.items():
+            method_upper = method.upper()
+            
+            # Skip common non-API or internal methods (like OPTIONS/HEAD) unless explicitly wanted.
+            if method_upper not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                continue
+                
+            # Extract basic info
+            operation_id = operation.get("operationId", "")
+            summary = operation.get("summary", "")
+            desc = operation.get("description", result_description_fallback(method_upper, path))
+            
+            # Prefer operationId for tool_name if available, else generate one
+            tool_name = operation_id if operation_id else _route_to_tool_name(method_upper, path)
+            
+            # Extract parameters
+            path_params = []
+            query_params = {}
+            
+            # OpenAPI 3.0 parameters array
+            parameters = operation.get("parameters", [])
+            for param in parameters:
+                if param.get("in") == "path":
+                    path_params.append(param.get("name"))
+                elif param.get("in") == "query":
+                    name = param.get("name")
+                    schema = param.get("schema", {})
+                    query_params[name] = {
+                        "type": schema.get("type", "string"),
+                        "description": param.get("description", name),
+                        "required": param.get("required", False)
+                    }
+                    if schema.get("enum"):
+                        query_params[name]["enum"] = schema["enum"]
+
+            # Extract Request Body parameters for POST/PUT/PATCH
+            body_params = {}
+            request_body = operation.get("requestBody", {})
+            if request_body:
+                content = request_body.get("content", {})
+                json_content = content.get("application/json", {})
+                body_schema = json_content.get("schema", {})
+                
+                # Check for $ref in body schema (would need full resolution, 
+                # but for simple cases we just log it or pass a generic body)
+                if "$ref" in body_schema:
+                    ref_path = body_schema["$ref"]
+                    # E.g. "#/components/schemas/Item"
+                    if ref_path.startswith("#/components/schemas/"):
+                        model_name = ref_path.split("/")[-1]
+                        components = spec.get("components", {}).get("schemas", {})
+                        actual_schema = components.get(model_name, {})
+                        
+                        properties = actual_schema.get("properties", {})
+                        required_fields = actual_schema.get("required", [])
+                        
+                        for p_name, p_schema in properties.items():
+                            body_params[p_name] = {
+                                "type": p_schema.get("type", "string"),
+                                "description": p_schema.get("description", p_name),
+                                "required": p_name in required_fields
+                            }
+                elif body_schema.get("type") == "object":
+                    properties = body_schema.get("properties", {})
+                    required_fields = body_schema.get("required", [])
+                    
+                    for p_name, p_schema in properties.items():
+                         body_params[p_name] = {
+                            "type": p_schema.get("type", "string"),
+                            "description": p_schema.get("description", p_name),
+                            "required": p_name in required_fields
+                        }
+
+            # Combine query and body params into a single manual_params dict for our generic builder
+            combined_params = {**query_params, **body_params}
+            
+            endpoints.append({
+                "method": method_upper,
+                "path": path,
+                "path_params": path_params,
+                "tool_name": tool_name,
+                "description": summary or desc,
+                "manual_params": combined_params if combined_params else None
+            })
+
+    logger.info(f"Discovered {len(endpoints)} OpenAPI endpoints from {url}")
+    return endpoints
+
+def result_description_fallback(method: str, path: str) -> str:
+    return f"{method} {path}"
+
 
 
 def _route_to_tool_name(method: str, path: str) -> str:
@@ -129,6 +252,10 @@ def endpoint_to_tool(
     """
     tool_name = f"{project_name}__{endpoint['tool_name']}"
     description = endpoint.get("description", f"{endpoint['method']} {endpoint['path']}")
+
+    # If the endpoint came from OpenAPI and provided explicit manual_params, use them.
+    if manual_params is None and "manual_params" in endpoint:
+        manual_params = endpoint["manual_params"]
 
     # Build parameters
     properties: Dict[str, Any] = {}

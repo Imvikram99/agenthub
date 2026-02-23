@@ -22,9 +22,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import yaml
+from arq import create_pool
+from arq.connections import RedisSettings
 
 from .discovery import (
     scan_routes,
+    fetch_openapi,
     endpoint_to_tool,
     cli_command_to_tool,
     custom_tool_to_schema,
@@ -64,6 +67,13 @@ class Project:
                 tool = endpoint_to_tool(self.name, ep)
                 tools.append(tool)
             logger.info(f"[{self.name}] scan_routes discovered {len(tools)} tools")
+
+        elif method == "openapi":
+            endpoints = fetch_openapi(self.url, headers=self.default_headers)
+            for ep in endpoints:
+                tool = endpoint_to_tool(self.name, ep)
+                tools.append(tool)
+            logger.info(f"[{self.name}] openapi discovered {len(endpoints)} tools")
 
         elif method == "manual":
             # API endpoints
@@ -139,6 +149,7 @@ class ProjectRegistry:
         self.projects: Dict[str, Project] = {}
         self.tools: List[Dict[str, Any]] = []
         self._tool_meta: Dict[str, Dict[str, Any]] = {}  # tool_name → metadata
+        self._redis_pool = None
 
     def load(self) -> None:
         """Load projects from YAML and run discovery."""
@@ -155,6 +166,29 @@ class ProjectRegistry:
             self.projects[name] = project
 
         self._rebuild_tools()
+
+        # Add the generic global tool for checking ARQ task status
+        self.tools.append({
+            "type": "function",
+            "function": {
+                "name": "check_task_status",
+                "description": "Check the status of a background CLI task using its queued job ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The job ID returned when the CLI tool was launched."
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        })
+        # Note: we handle it directly in execute_tool, so no _tool_meta entry is strictly required
+        # but we'll add one so execute_tool knows how to route it.
+        self._tool_meta["check_task_status"] = {"type": "system_global"}
+
         logger.info(f"Registry loaded: {len(self.projects)} projects, {len(self.tools)} tools")
 
     def _rebuild_tools(self) -> None:
@@ -294,6 +328,12 @@ If user just says "run analysis" without specifying holdings, use `rothchild_run
 
     # ── Generic Tool Executor ──────────────────────────────────────────────────
 
+    async def get_redis(self):
+        """Lazy load Redis ARQ connection pool."""
+        if self._redis_pool is None:
+            self._redis_pool = await create_pool(RedisSettings())
+        return self._redis_pool
+
     async def execute_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         """
         Generic tool executor. Uses tool metadata to decide how to dispatch.
@@ -309,13 +349,19 @@ If user just says "run analysis" without specifying holdings, use `rothchild_run
             return json.dumps({"error": f"Project not found: {project_name}"})
 
         try:
+            # Handle strictly global hub tools
+            if meta.get("type") == "system_global":
+                if tool_name == "check_task_status":
+                    return await self._execute_check_task_status(args)
+                return json.dumps({"error": f"Unknown global tool: {tool_name}"})
+
             # Custom tools need specific handlers
             if meta.get("type") == "custom":
                 return await self._execute_custom(tool_name, args, project, meta)
 
             # CLI tools
             if meta.get("type") == "cli":
-                return self._execute_cli(tool_name, args, project, meta)
+                return await self._execute_cli(tool_name, args, project, meta)
 
             # API tools (default)
             return await self._execute_api(tool_name, args, project, meta)
@@ -366,11 +412,11 @@ If user just says "run analysis" without specifying holdings, use `rothchild_run
 
             return json.dumps(r.json(), indent=2, default=str)
 
-    def _execute_cli(
+    async def _execute_cli(
         self, tool_name: str, args: Dict[str, Any],
         project: Project, meta: Dict[str, Any],
     ) -> str:
-        """Execute a CLI tool as background subprocess."""
+        """Execute a CLI tool as an ARQ asynchronous background task."""
         script = meta.get("script", "")
         python_bin = project.python_bin()
 
@@ -396,22 +442,59 @@ If user just says "run analysis" without specifying holdings, use `rothchild_run
             else:
                 cmd.extend([flag, str(value)])
 
-        with open(log_path, "w") as log_f:
-            log_f.write(f"[hub] cmd: {' '.join(cmd)}\n\n")
-            log_f.flush()
-            subprocess.Popen(
-                cmd, env=env, cwd=project.root,
-                stdin=subprocess.DEVNULL,
-                stdout=log_f.fileno(), stderr=log_f.fileno(),
-                close_fds=True, start_new_session=True,
+        # Dispatch background job to ARQ instead of spawning inline
+        try:
+            redis = await self.get_redis()
+            # Enqueue the job for our worker
+            job = await redis.enqueue_job(
+                "run_cli_command",
+                cmd=cmd,
+                env=env,
+                cwd=project.root,
+                log_path=log_path
             )
+            
+            return json.dumps({
+                "status": "queued",
+                "task_id": job.job_id,
+                "log_path": log_path,
+                "command": " ".join(cmd),
+                "message": f"Job queued to worker. ID: {job.job_id}",
+            })
+        except Exception as e:
+            logger.error(f"Failed to queue task to ARQ: {e}")
+            return json.dumps({
+                "error": f"Task Queue error: {e}. Is Redis and the worker running?"
+            })
 
-        return json.dumps({
-            "status": "launched",
-            "log_path": log_path,
-            "command": " ".join(cmd),
-            "message": "Use rothchild_read_log to see results.",
-        })
+    async def _execute_check_task_status(self, args: Dict[str, Any]) -> str:
+        """Check status of an ARQ job."""
+        task_id = args.get("task_id")
+        if not task_id:
+            return json.dumps({"error": "task_id is required"})
+
+        try:
+            redis = await self.get_redis()
+            from arq.jobs import Job
+            job = Job(task_id, redis)
+            
+            status = await job.status()
+            info = await job.info()
+            
+            result_payload = {
+                "task_id": task_id,
+                "status": status.value,
+            }
+            
+            if status.value == "complete":
+                result = await job.result()
+                result_payload.update(result)
+            
+            return json.dumps(result_payload, indent=2, default=str)
+            
+        except Exception as e:
+            logger.error(f"Failed to check task status: {e}")
+            return json.dumps({"error": str(e)})
 
     async def _execute_custom(
         self, tool_name: str, args: Dict[str, Any],
