@@ -98,7 +98,7 @@ projects:
           description: "Generate the full date-stamped portfolio analysis packet using default portfolio only"
           args: {}
         - name: rothchild_run_portfolio
-          script: "run_sample.py"
+          script: "generate_packet.py"
           description: "Run advisor against a specific portfolio CSV — use this after rothchild_create_portfolio"
           args:
             portfolio: {type: string, required: true, description: "Path to portfolio CSV file (use csv_path from rothchild_create_portfolio)"}
