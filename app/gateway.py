@@ -700,8 +700,38 @@ async def chat(req: ChatRequest):
 
         # Find result files, filtered by job queue time to prevent cross-user mix-up
         file_paths = _find_latest_result_files(not_before=not_before)
-        if not file_paths:
+        if file_paths:
+            # Archive the result files to a user-scoped permanent directory
+            rotchild_project = registry.projects.get("rothchild")
+            if rotchild_project:
+                archive_dir = await _archive_result_files(
+                    file_paths, session_id, rotchild_project.root
+                )
+                if archive_dir:
+                    # Save to Layer 1 memory facts for future resend
+                    from app.hub.memory import save_user_fact
+                    await save_user_fact(session_id, "last_result_dir", archive_dir)
+                    await save_user_fact(session_id, "last_result_date",
+                                       datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        else:
             output += "\n\n⚠️ Could not find result files. The analysis may still be running — try asking again in a minute."
+
+    elif "[GET_LAST_REPORTS]" in output:
+        # User wants to resend the last analysis — no re-run needed
+        output = output.replace("[GET_LAST_REPORTS]", "").strip() or "Here are your last portfolio reports:"
+        from app.hub.memory import get_user_facts
+        facts = await get_user_facts(session_id)
+        last_dir = facts.get("last_result_dir", "")
+        if last_dir and os.path.isdir(last_dir):
+            file_paths = [
+                os.path.join(last_dir, f)
+                for f in ["result.md", "result2.md"]
+                if os.path.exists(os.path.join(last_dir, f))
+            ]
+            last_date = facts.get("last_result_date", "unknown date")
+            output = f"📄 Resending your last analysis ({last_date}):"
+        else:
+            output = "⚠️ No previous analysis found. Please share your portfolio holdings and I'll run a fresh analysis."
 
     # Save to session history (for logging/portfolio reports)
     history = await get_session(session_id)
@@ -744,6 +774,28 @@ def _find_latest_result_files(not_before: Optional[float] = None) -> List[str]:
             continue
         paths.append(fpath)
     return paths
+
+
+async def _archive_result_files(file_paths: List[str], user_id: str, rothchild_root: str) -> str:
+    """Copy result files to a user-scoped archive directory for permanent storage.
+
+    Returns the archive directory path, or empty string on failure.
+    Archive structure: data/archive/{user_id}/{YYYYMMDD_HHMMSS}/
+    Each user gets isolated storage — multiple portfolios accumulate over time.
+    """
+    import shutil
+    try:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_dir = os.path.join(rothchild_root, "data", "archive", str(user_id), ts)
+        os.makedirs(archive_dir, exist_ok=True)
+        for fpath in file_paths:
+            dest = os.path.join(archive_dir, os.path.basename(fpath))
+            shutil.copy2(fpath, dest)
+            logger.info(f"Archived {os.path.basename(fpath)} → {archive_dir}")
+        return archive_dir
+    except Exception as e:
+        logger.error(f"Failed to archive result files: {e}")
+        return ""
 
 
 @app.post("/chat/stream", dependencies=[Depends(verify_api_key)])

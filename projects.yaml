@@ -80,6 +80,10 @@ projects:
          Do NOT read or summarise the file contents yourself.
 
       NEVER: serve cached/old results, skip portfolio creation, or chunk the report text yourself.
+
+      RESEND FLOW: If the user asks to "send PDF again", "resend last analysis", "give me the report again",
+      or similar — do NOT re-run. Respond with ONLY: [GET_LAST_REPORTS]
+      The system will instantly retrieve the archived reports from the last run.
     discovery:
       method: manual
       commands:
