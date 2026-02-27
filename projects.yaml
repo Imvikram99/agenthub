@@ -73,8 +73,10 @@ projects:
          The analysis runs in the background — you will get a job_id back.
       3. Wait and poll: IMMEDIATELY call `check_task_status` with the job_id. Keep polling every 15-20 seconds.
          The run takes 2-5 minutes. Do NOT give up early. Keep polling until status == "complete" or "failed".
-      4. Send reports: Once complete, respond with ONLY the text: [SEND_PORTFOLIO_FILES]
-         The system will automatically attach the fresh PDF/markdown reports to the Telegram message.
+      4. Send reports: Once complete, respond with ONLY: [SEND_PORTFOLIO_FILES:{job_id}]
+         Replace {job_id} with the actual task_id returned by rothchild_run_portfolio.
+         Example: [SEND_PORTFOLIO_FILES:9b4c7a9ada6d4ea290d11830ab8bc482]
+         The system will attach the correct fresh reports to the Telegram message.
          Do NOT read or summarise the file contents yourself.
 
       NEVER: serve cached/old results, skip portfolio creation, or chunk the report text yourself.

@@ -675,16 +675,31 @@ async def chat(req: ChatRequest):
     reports = None
     file_paths = None
 
-    if "[SEND_PORTFOLIO_FILES]" in output or "[SEND_PORTFOLIO_REPORTS]" in output:
-        output = (
-            output
-            .replace("[SEND_PORTFOLIO_FILES]", "")
-            .replace("[SEND_PORTFOLIO_REPORTS]", "")
-            .strip()
-        ) or "✅ Portfolio analysis complete! Sending reports..."
+    if "[SEND_PORTFOLIO_FILES" in output or "[SEND_PORTFOLIO_REPORTS]" in output:
+        # Extract optional job_id from tag: [SEND_PORTFOLIO_FILES:job_id] or [SEND_PORTFOLIO_FILES]
+        job_id = None
+        import re as _re
+        m = _re.search(r"\[SEND_PORTFOLIO_FILES:([a-f0-9]+)\]", output)
+        if m:
+            job_id = m.group(1)
 
-        # Try to find the freshest result files from rothchild
-        file_paths = _find_latest_result_files()
+        output = _re.sub(r"\[SEND_PORTFOLIO_FILES[^\]]*\]", "", output)
+        output = output.replace("[SEND_PORTFOLIO_REPORTS]", "").strip()
+        output = output or "✅ Portfolio analysis complete! Sending reports..."
+
+        # Look up when this job was queued — only accept files written after that time
+        not_before = None
+        if job_id:
+            try:
+                r = await _get_redis()
+                ts = await r.get(f"hub:job:{job_id}:queued_at")
+                if ts:
+                    not_before = float(ts)
+            except Exception:
+                pass
+
+        # Find result files, filtered by job queue time to prevent cross-user mix-up
+        file_paths = _find_latest_result_files(not_before=not_before)
         if not file_paths:
             output += "\n\n⚠️ Could not find result files. The analysis may still be running — try asking again in a minute."
 
@@ -699,8 +714,13 @@ async def chat(req: ChatRequest):
     return ChatResponse(output=output, session_id=session_id, reports=reports, file_paths=file_paths)
 
 
-def _find_latest_result_files() -> List[str]:
-    """Find the most recently modified result.md and result2.md from rothchild."""
+def _find_latest_result_files(not_before: Optional[float] = None) -> List[str]:
+    """Find freshest result.md and result2.md from rothchild.
+    
+    Args:
+        not_before: Unix timestamp. If set, only return files modified at or after this time.
+                    This prevents multi-user race conditions where User A picks up User B's results.
+    """
     import glob
     rothchild_project = registry.projects.get("rothchild")
     if not rothchild_project:
@@ -708,16 +728,21 @@ def _find_latest_result_files() -> List[str]:
     result_base = os.path.join(rothchild_project.root, "data", "result")
     if not os.path.exists(result_base):
         return []
-    # Find all result subdirs, pick the freshest by mtime (not name — today's run may have a new subdir)
     subdirs = [d for d in glob.glob(os.path.join(result_base, "*")) if os.path.isdir(d)]
     if not subdirs:
         return []
+    # Pick the subdir with the most recently modified result file
     latest = max(subdirs, key=os.path.getmtime)
     paths = []
     for fname in ["result.md", "result2.md"]:
         fpath = os.path.join(latest, fname)
-        if os.path.exists(fpath):
-            paths.append(fpath)
+        if not os.path.exists(fpath):
+            continue
+        # Guard: only accept files written after this job was queued
+        if not_before is not None and os.path.getmtime(fpath) < not_before:
+            logger.warning(f"Skipping stale result file (mtime predates job queue): {fpath}")
+            continue
+        paths.append(fpath)
     return paths
 
 

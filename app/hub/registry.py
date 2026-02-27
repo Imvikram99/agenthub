@@ -472,6 +472,9 @@ If user just says "run preview analysis" without specifying holdings, use `rothc
                 cwd=project.root,
                 log_path=log_path
             )
+            # Stamp the queue time so the gateway can do job-scoped result pickup
+            import time
+            await redis.set(f"hub:job:{job.job_id}:queued_at", str(time.time()), ex=3600)
             
             return json.dumps({
                 "status": "queued",
