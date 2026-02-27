@@ -662,6 +662,7 @@ class ChatResponse(BaseModel):
     output: str
     session_id: str
     reports: Optional[List[str]] = None
+    file_paths: Optional[List[str]] = None  # Absolute paths to files to send as attachments
 
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
@@ -672,27 +673,20 @@ async def chat(req: ChatRequest):
     output = await agent_chat(session_id, req.prompt)
     
     reports = None
-    if "[SEND_PORTFOLIO_REPORTS]" in output:
-        output = output.replace("[SEND_PORTFOLIO_REPORTS]", "Here are your portfolio analysis reports:").strip()
-        if not output:
-             output = "Here are your portfolio analysis reports:"
+    file_paths = None
 
-        import glob
-        rothchild_project = registry.projects.get("rothchild")
-        result_base = os.path.join(rothchild_project.root, "data", "result") if rothchild_project else ""
-        if result_base and os.path.exists(result_base):
-            subdirs = sorted([d for d in glob.glob(os.path.join(result_base, "*")) if os.path.isdir(d)])
-            if subdirs:
-                latest = subdirs[-1]
-                md1 = os.path.join(latest, "result.md")
-                md2 = os.path.join(latest, "result2.md")
-                reports = []
-                if os.path.exists(md1):
-                    with open(md1, "r", encoding="utf-8") as f:
-                        reports.append(f.read())
-                if os.path.exists(md2):
-                    with open(md2, "r", encoding="utf-8") as f:
-                        reports.append(f.read())
+    if "[SEND_PORTFOLIO_FILES]" in output or "[SEND_PORTFOLIO_REPORTS]" in output:
+        output = (
+            output
+            .replace("[SEND_PORTFOLIO_FILES]", "")
+            .replace("[SEND_PORTFOLIO_REPORTS]", "")
+            .strip()
+        ) or "✅ Portfolio analysis complete! Sending reports..."
+
+        # Try to find the freshest result files from rothchild
+        file_paths = _find_latest_result_files()
+        if not file_paths:
+            output += "\n\n⚠️ Could not find result files. The analysis may still be running — try asking again in a minute."
 
     # Save to session history (for logging/portfolio reports)
     history = await get_session(session_id)
@@ -700,14 +694,31 @@ async def chat(req: ChatRequest):
     history.append({"role": "assistant", "content": output})
     await save_session(session_id, history)
 
-    full_output = output
-    if reports:
-        for r in reports:
-            full_output += f"\n\n--- Report ---\n{r}"
+    log_chat_interaction(session_id, req.prompt, output, req.context)
 
-    log_chat_interaction(session_id, req.prompt, full_output, req.context)
+    return ChatResponse(output=output, session_id=session_id, reports=reports, file_paths=file_paths)
 
-    return ChatResponse(output=output, session_id=session_id, reports=reports)
+
+def _find_latest_result_files() -> List[str]:
+    """Find the most recently modified result.md and result2.md from rothchild."""
+    import glob
+    rothchild_project = registry.projects.get("rothchild")
+    if not rothchild_project:
+        return []
+    result_base = os.path.join(rothchild_project.root, "data", "result")
+    if not os.path.exists(result_base):
+        return []
+    # Find all result subdirs, pick the freshest by mtime (not name — today's run may have a new subdir)
+    subdirs = [d for d in glob.glob(os.path.join(result_base, "*")) if os.path.isdir(d)]
+    if not subdirs:
+        return []
+    latest = max(subdirs, key=os.path.getmtime)
+    paths = []
+    for fname in ["result.md", "result2.md"]:
+        fpath = os.path.join(latest, fname)
+        if os.path.exists(fpath):
+            paths.append(fpath)
+    return paths
 
 
 @app.post("/chat/stream", dependencies=[Depends(verify_api_key)])

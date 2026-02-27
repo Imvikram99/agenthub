@@ -63,30 +63,43 @@ projects:
     root: /Users/apple/Documents/vikram_workspace/mylanggraph/rothchild
     venv: .venv
     description: >
-      Investment portfolio advisor. Runs portfolio analysis, thesis evaluation,
-      crash detection, drift alerts, and rebalancing recommendations.
+      Investment portfolio advisor. Analyzes holdings for risk, momentum, thesis, crash signals, and rebalancing.
+
+      IMPORTANT WORKFLOW — Always follow this exact order when the user wants portfolio analysis:
+      1. Create portfolio: If the user provides holdings (any format), ALWAYS call `rothchild_create_portfolio` first to create a CSV.
+         Save the returned `csv_path` for step 2.
+      2. Run analysis: Call `rothchild_run_portfolio` with the `portfolio` arg set to the `csv_path` from step 1.
+         Do NOT use `rothchild_run` (uses old default portfolio) or `rothchild_generate_packet` (no portfolio arg).
+         The analysis runs in the background — you will get a job_id back.
+      3. Wait and poll: IMMEDIATELY call `check_task_status` with the job_id. Keep polling every 15-20 seconds.
+         The run takes 2-5 minutes. Do NOT give up early. Keep polling until status == "complete" or "failed".
+      4. Send reports: Once complete, respond with ONLY the text: [SEND_PORTFOLIO_FILES]
+         The system will automatically attach the fresh PDF/markdown reports to the Telegram message.
+         Do NOT read or summarise the file contents yourself.
+
+      NEVER: serve cached/old results, skip portfolio creation, or chunk the report text yourself.
     discovery:
       method: manual
       commands:
         - name: rothchild_run
           script: "-m src.runner"
-          description: "Run advisor with default sample portfolio"
+          description: "Run advisor with default sample portfolio (use only if user has not provided holdings)"
           args:
             cadence: {type: string, enum: [daily, weekly, monthly, quarterly], description: "Report cadence"}
             dry-run: {type: boolean, flag: true, description: "Show what would run without executing"}
         - name: rothchild_generate_packet
           script: "generate_packet.py"
-          description: "Generate the full date-stamped portfolio analysis packet and ingest real external market data"
+          description: "Generate the full date-stamped portfolio analysis packet using default portfolio only"
           args: {}
         - name: rothchild_run_portfolio
           script: "run_sample.py"
-          description: "Run advisor against a specific portfolio CSV"
+          description: "Run advisor against a specific portfolio CSV — use this after rothchild_create_portfolio"
           args:
-            portfolio: {type: string, required: true, description: "Path to portfolio CSV file"}
+            portfolio: {type: string, required: true, description: "Path to portfolio CSV file (use csv_path from rothchild_create_portfolio)"}
     # Extra tools that need custom logic (can't be auto-generated from CLI)
     custom_tools:
       - name: rothchild_create_portfolio
-        description: "Create portfolio CSV from natural language holdings"
+        description: "Create portfolio CSV from natural language holdings. Returns csv_path — pass to rothchild_run_portfolio."
         params:
           holdings:
             type: array
@@ -101,8 +114,9 @@ projects:
               buy_date: {type: string}
           portfolio_name: {type: string}
       - name: rothchild_read_log
-        description: "Read the latest run log to get analysis results"
+        description: "Read the latest run log to check analysis progress or errors"
         params: {}
+
 
   antigravity:
     type: cli

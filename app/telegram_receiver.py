@@ -44,9 +44,26 @@ except Exception as e:
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:9000/chat")
 
+# Longer timeout for Rothchild analysis runs (can take 3-5 minutes)
+GATEWAY_TIMEOUT_SECONDS = int(os.getenv("GATEWAY_TIMEOUT", "420"))  # 7 minutes
+
 if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN is not set in the environment variables.")
     exit(1)
+
+
+async def _send_typing_loop(context, chat_id, stop_event: asyncio.Event):
+    """Keep sending 'typing' action every 4s until stop_event is set."""
+    while not stop_event.is_set():
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=4)
+        except asyncio.TimeoutError:
+            pass
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -54,15 +71,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = str(update.message.chat_id)
     text = update.message.text
-    
-    logger.info(f"Received message from {chat_id}: {text}")
+
+    logger.info(f"Received message from {chat_id}: {text[:80]}")
+
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(_send_typing_loop(context, update.message.chat_id, stop_typing))
 
     try:
-        # Show typing action while the gateway processes the request
-        await context.bot.send_chat_action(chat_id=update.message.chat_id, action=ChatAction.TYPING)
-
         # Forward the message to the Agent Hub Gateway
-        async with httpx.AsyncClient(timeout=120) as client:
+        # Long timeout — Rothchild analysis can take 3-5 minutes
+        async with httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_SECONDS) as client:
             payload = {
                 "prompt": text,
                 "session_id": chat_id,
@@ -75,50 +93,82 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = await client.post(GATEWAY_URL, json=payload)
             response.raise_for_status()
             data = response.json()
-            
-            reply_text = data.get("output", "No response received from Gateway.")
-            
-            # Send the response back to Telegram
+
+        reply_text = data.get("output", "No response received from Gateway.")
+        file_paths = data.get("file_paths") or []
+
+        # Stop typing indicator before sending reply
+        stop_typing.set()
+        await typing_task
+
+        # Send the main text response
+        if reply_text:
             await update.message.reply_text(reply_text)
-            
-            # Additional logic: Process exact reports bypassing the LLM
-            reports = data.get("reports")
-            if reports:
-                for report in reports:
-                    MAX_LEN = 4000
-                    chunks = []
-                    current_chunk = ""
-                    for par in report.split('\n\n'):
-                        if len(current_chunk) + len(par) + 2 > MAX_LEN:
-                            if current_chunk.strip():
-                                chunks.append(current_chunk.strip())
-                            current_chunk = par
-                        else:
-                            current_chunk += ("\n\n" + par) if current_chunk else par
+
+        # Send file attachments (result.md files) as documents
+        if file_paths:
+            await context.bot.send_chat_action(chat_id=update.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+            for fpath in file_paths:
+                if not os.path.exists(fpath):
+                    logger.warning(f"File not found for attachment: {fpath}")
+                    continue
+                fname = os.path.basename(fpath)
+                with open(fpath, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=update.message.chat_id,
+                        document=f,
+                        filename=fname,
+                        caption=f"📊 {fname}",
+                    )
+                logger.info(f"Sent document: {fname}")
+
+        # Legacy: chunked text reports (kept for backward compatibility, will be empty going forward)
+        reports = data.get("reports") or []
+        for report in reports:
+            MAX_LEN = 4000
+            chunks = []
+            current_chunk = ""
+            for par in report.split('\n\n'):
+                if len(current_chunk) + len(par) + 2 > MAX_LEN:
                     if current_chunk.strip():
                         chunks.append(current_chunk.strip())
-                        
-                    for chunk in chunks:
-                        if not chunk: continue
-                        # Safety fallback for individual massive paragraphs
-                        while len(chunk) > MAX_LEN:
-                            sub_chunk = chunk[:MAX_LEN]
-                            await update.message.reply_text(sub_chunk)
-                            chunk = chunk[MAX_LEN:]
-                        if chunk:
-                            await update.message.reply_text(chunk)
-            
+                    current_chunk = par
+                else:
+                    current_chunk += ("\n\n" + par) if current_chunk else par
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                while len(chunk) > MAX_LEN:
+                    await update.message.reply_text(chunk[:MAX_LEN])
+                    chunk = chunk[MAX_LEN:]
+                if chunk:
+                    await update.message.reply_text(chunk)
+
+    except httpx.ReadTimeout:
+        stop_typing.set()
+        await typing_task
+        logger.error(f"Gateway timed out after {GATEWAY_TIMEOUT_SECONDS}s for chat {chat_id}")
+        await update.message.reply_text(
+            "⏳ The analysis is taking longer than expected. "
+            "Please try: *'What's the status of my analysis?'* in a minute.",
+            parse_mode="Markdown"
+        )
     except Exception as e:
+        stop_typing.set()
+        await typing_task
         logger.error(f"Error forwarding message to Hub Gateway: {e}")
         await update.message.reply_text("⚠️ Sorry, I couldn't reach the Hub Gateway right now.")
+
 
 if __name__ == "__main__":
     logger.info("Starting Telegram Bot Receiver...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    
+
     # Handle all text messages (including commands right now to forward everything to LLM)
     all_text_handler = MessageHandler(filters.TEXT, handle_message)
     app.add_handler(all_text_handler)
-    
+
     logger.info("Listening for messages...")
     app.run_polling()
