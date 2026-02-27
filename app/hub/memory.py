@@ -179,14 +179,50 @@ async def build_memory_context(user_id: str, query: str) -> str:
     """
     Build the full memory context string for injection into the system prompt.
     Combines Layer 1 (facts) + Layer 2 (preferences).
+    Formats facts as ACTIONABLE instructions so the LLM uses them.
     """
     parts = []
 
-    # Layer 1: Structured facts
+    # Layer 1: Structured facts — formatted as actionable LLM instructions
     facts = await get_user_facts(user_id)
     if facts:
-        fact_lines = "\n".join(f"  - {k}: {v}" for k, v in facts.items())
-        parts.append(f"Known facts about this user:\n{fact_lines}")
+        parts.append("=== USER MEMORY (use this information, do NOT ask the user to repeat it) ===")
+
+        # Portfolio-specific facts → make them directly actionable
+        portfolio_path = facts.get("portfolio_path")
+        if portfolio_path:
+            p_date = facts.get("portfolio_date", "unknown date")
+            p_name = facts.get("portfolio_name", "portfolio")
+            p_count = facts.get("portfolio_holdings_count", "?")
+            parts.append(
+                f"PORTFOLIO: This user already has a portfolio CSV at: {portfolio_path}\n"
+                f"  Portfolio name: {p_name} | Holdings: {p_count} stocks | Created: {p_date}\n"
+                f"  → If the user asks to analyse their portfolio, do NOT ask for holdings again.\n"
+                f"    Use rothchild_run_portfolio with portfolio={portfolio_path} directly."
+            )
+
+        last_result = facts.get("last_result_dir")
+        if last_result:
+            r_date = facts.get("last_result_date", "unknown date")
+            parts.append(
+                f"LAST ANALYSIS: Results archived at: {last_result} (run on {r_date})\n"
+                f"  → If the user asks to resend/see their last report, respond with [GET_LAST_REPORTS]"
+            )
+
+        last_analysis = facts.get("last_analysis_date")
+        if last_analysis:
+            parts.append(f"LAST ANALYSIS DATE: {last_analysis}")
+
+        # Any other facts not covered above
+        skip_keys = {"portfolio_path", "portfolio_date", "portfolio_name",
+                     "portfolio_holdings_count", "last_result_dir", "last_result_date",
+                     "last_analysis_date", "last_packet_date"}
+        other = {k: v for k, v in facts.items() if k not in skip_keys}
+        if other:
+            for k, v in other.items():
+                parts.append(f"  {k}: {v}")
+
+        parts.append("=== END USER MEMORY ===")
 
     # Layer 2: Semantic preferences
     prefs = recall_user_preferences(user_id, query)
@@ -196,7 +232,7 @@ async def build_memory_context(user_id: str, query: str) -> str:
     if not parts:
         return ""
 
-    return "\n\n" + "\n\n".join(parts)
+    return "\n\n" + "\n".join(parts)
 
 
 # ── Tool Fact Hooks ──────────────────────────────────────────────────────────
