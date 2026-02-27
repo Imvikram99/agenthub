@@ -373,6 +373,7 @@ async def agent_node(state: AgentState) -> Dict[str, Any]:
 async def tools_node(state: AgentState) -> Dict[str, Any]:
     """Execute tools requested by the LLM."""
     messages = state["messages"]
+    session_id = state.get("session_id", "default")
     last_message = messages[-1]
     
     tool_calls = last_message.get("tool_calls", [])
