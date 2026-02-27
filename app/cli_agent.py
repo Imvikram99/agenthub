@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Annotated, Any, Dict, List, Optional
 import operator
 
@@ -18,6 +19,11 @@ from app.gateway import (
     logger,
     validate_tool_arguments
 )
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+MAX_LLM_CALLS_PER_TASK = int(os.environ.get("CLI_MAX_LLM_CALLS", "30"))
+MAX_SUBTASK_RETRIES = 4
 
 # ── Pydantic Models for Planning ──────────────────────────────────────────────
 
@@ -50,6 +56,7 @@ class CLIState(TypedDict):
     completed_steps: Annotated[list, operator.add]
     final_report: str
     retry_count: int
+    llm_call_count: int  # Track total LLM calls to enforce cost cap
 
 # ── Nodes ────────────────────────────────────────────────────────────────────
 
@@ -137,7 +144,13 @@ async def run_subtask_node(state: CLIState) -> Dict[str, Any]:
     
     if idx >= len(plan):
         return {}
-        
+    
+    # Enforce max LLM calls to prevent runaway costs
+    call_count = state.get("llm_call_count", 0)
+    if call_count >= MAX_LLM_CALLS_PER_TASK:
+        logger.warning(f"Hit max LLM call limit ({MAX_LLM_CALLS_PER_TASK})")
+        return {"worker_messages": [{"role": "assistant", "content": f"Aborted: hit max LLM call limit ({MAX_LLM_CALLS_PER_TASK}). Forcing completion."}]}
+
     current_task = plan[idx]
     logger.info(f"Nodes -> Running Subtask {idx+1}/{len(plan)}: {current_task.description[:60]}...")
     
@@ -198,10 +211,10 @@ If you have completed the step, summarize your findings in a final text response
                 for tc in msg_obj.tool_calls
             ]
             
-        return {"worker_messages": [message_dict]}
+        return {"worker_messages": [message_dict], "llm_call_count": call_count + 1}
     except Exception as e:
         logger.error(f"Worker LLM error: {e}")
-        return {"worker_messages": [{"role": "assistant", "content": f"Error: {e}"}]}
+        return {"worker_messages": [{"role": "assistant", "content": f"Error: {e}"}], "llm_call_count": call_count + 1}
 
 
 async def execute_tools_node(state: CLIState) -> Dict[str, Any]:
@@ -253,63 +266,11 @@ class SubtaskReflection(BaseModel):
     is_complete: bool = Field(..., description="Is the current subtask completely finished based on the expected outcome?")
     summary: str = Field(..., description="A 1-2 sentence summary of what was actually achieved or the final blocker.")
 
-async def verify_subtask_node(state: CLIState) -> Dict[str, Any]:
-    """Reflects on the worker's output to determine if the task is genuinely complete."""
-    plan = state.get("plan", [])
-    idx = state.get("current_task_index", 0)
-    current_task = plan[idx]
-    messages = state.get("worker_messages", [])
-    
-    logger.info("Nodes -> Verifying Subtask Completion")
-    
-    # We compile the subtask history for reflection
-    history_dump = "\n".join([f"{m['role'].upper()}: {m.get('content', 'tool_calls')}" for m in messages[-10:]])
-    
-    prompt = f"""
-Analyze the recent execution history for the following task:
-TASK: {current_task.description}
-EXPECTED OUTCOME: {current_task.expected_outcome}
-
-HISTORY:
-{history_dump}
-
-Has the task been successfully completed?
-"""
-    try:
-        reflection: SubtaskReflection = await client.chat.completions.create(
-            model=HUB_MODEL,
-            response_model=SubtaskReflection,
-            messages=[
-                {"role": "system", "content": "You are a harsh but fair evaluator. Determine if a subtask is finished."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-    except Exception as e:
-        logger.error(f"Reflection failed: {e}. Defaulting to true.")
-        reflection = SubtaskReflection(is_complete=True, summary="Assumed complete due to error.")
-
-    if reflection.is_complete or state.get("retry_count", 0) > 4:
-        logger.info(f"Subtask complete (or max limits): {reflection.summary}")
-        # Proceed to next task! Reset worker messages and increment index.
-        summary_log = f"Step {idx+1} ({current_task.description[:30]}...): {reflection.summary}"
-        return {
-            "current_task_index": idx + 1,
-            "completed_steps": [summary_log],
-            "worker_messages": [], # Reset internal scratchpad! (Must be handled carefully by overriding in the real reducer, but LangGraph `add_messages` doesn't support clearing easily. To clear `worker_messages`, we can filter it or we just keep appending but that bloats context. For now, we will use a workaround or redefine the reducer).
-            "retry_count": 0
-        }
-    else:
-        logger.info(f"Subtask incomplete. Telling worker to continue. Reason: {reflection.summary}")
-        # Not complete, send a message back to the worker to try again.
-        return {
-            "worker_messages": [{"role": "user", "content": f"Update from Evaluator: The task is not complete yet. Reflection: {reflection.summary}. Keep trying."}],
-            "retry_count": state.get("retry_count", 0) + 1
-        }
 
 async def generate_final_report_node(state: CLIState) -> Dict[str, Any]:
     """Generates the final wrap-up report after all tasks finish."""
     completed = state.get("completed_steps", [])
-    report = "### Multis-Agent Execution Complete\n\n"
+    report = "### Multi-Agent Execution Complete\n\n"
     for step in completed:
         report += f"- {step}\n"
     
@@ -332,7 +293,6 @@ def route_planner(state: CLIState) -> str:
         return "generate_report"
     return "run_subtask"
 
-# We use verify_subtask_node which returns "CLEAR" to reset the worker_messages
 
 async def verify_subtask_node(state: CLIState) -> Dict[str, Any]:
     plan = state.get("plan", [])

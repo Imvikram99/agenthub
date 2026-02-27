@@ -25,7 +25,8 @@ async def run_cli_agent(prompt: str):
         "worker_messages": [],
         "completed_steps": [],
         "final_report": "",
-        "retry_count": 0
+        "retry_count": 0,
+        "llm_call_count": 0
     }
 
     try:

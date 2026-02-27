@@ -1,6 +1,32 @@
-fastapi>=0.104.0
-uvicorn>=0.24.0
-httpx>=0.25.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
+# Core Web Framework
+fastapi>=0.129.0
+uvicorn>=0.41.0
+httpx>=0.28.0
+python-dotenv>=1.2.0
+pydantic>=2.12.0
 pyyaml>=6.0
+
+# LLM & AI
+openai>=1.0.0
+instructor>=1.14.0
+langgraph>=1.0.0
+langgraph-checkpoint>=4.0.0
+langchain-core>=1.2.0
+langchain-openai>=1.1.0
+
+# Vector Store (Long-Term Memory)
+langchain-qdrant>=1.1.0
+qdrant-client>=1.17.0
+
+# Background Task Queue
+arq>=0.27.0
+redis>=5.3.0
+
+# Telegram
+python-telegram-bot>=22.0
+
+# CLI UI
+rich>=14.0.0
+
+# Typing
+typing_extensions>=4.15.0

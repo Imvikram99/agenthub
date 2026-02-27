@@ -20,20 +20,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime
 import json
 import logging
+import operator
 import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 
 import instructor
@@ -50,10 +53,18 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 from app.hub.registry import ProjectRegistry
+from app.hub.memory import (
+    init_layer2,
+    build_memory_context,
+    process_tool_facts,
+    extract_and_save_memories,
+)
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ALLOWED_WORKSPACE = os.getenv("HUB_WORKSPACE_ROOT", "/Users/apple/Documents/vikram_workspace")
+HUB_API_KEY = os.getenv("HUB_API_KEY", "")  # Empty = auth disabled (dev mode)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("hub_gateway")
@@ -64,6 +75,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 HUB_MODEL = os.getenv("HUB_MODEL", "anthropic/claude-sonnet-4")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_TOOL_ROUNDS = 8
+SESSION_TTL_SECONDS = int(os.getenv("HUB_SESSION_TTL", "86400"))  # 24 hours default
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 # ── Registry Setup ─────────────────────────────────────────────────────────────
 
@@ -99,41 +112,8 @@ if OPENAI_API_KEY:
 else:
     logger.warning("OPENAI_API_KEY not set. Long Term Memory (Qdrant) is disabled.")
 
-def get_user_memory(session_id: str, query: str) -> str:
-    """Retrieve relevant memory facts for this session."""
-    if not vector_store:
-        return ""
-        
-    try:
-        # We filter explicitly by session_id in the payload metadata
-        docs = vector_store.similarity_search(
-            query=query,
-            k=3,
-            filter={"must": [{"key": "session_id", "match": {"value": session_id}}]}
-        )
-        if not docs:
-            return ""
-        
-        facts = "\n".join(f"- {d.page_content}" for d in docs)
-        return f"\n\nRelevant past instructions from this user:\n{facts}"
-    except Exception as e:
-        logger.error(f"Error querying memory: {e}")
-        return ""
-
-def save_user_memory(session_id: str, fact: str):
-    """Save a new explicit preference to Qdrant."""
-    if not vector_store:
-        return
-    try:
-        from langchain_core.documents import Document
-        doc = Document(
-            page_content=fact,
-            metadata={"session_id": session_id, "timestamp": datetime.datetime.now().isoformat()}
-        )
-        vector_store.add_documents([doc])
-        logger.info(f"Saved memory for session {session_id}: {fact}")
-    except Exception as e:
-        logger.error(f"Error saving memory: {e}")
+# Initialize Layer 2 memory with shared Qdrant/LLM instances
+# (raw_client is defined later, so we defer init to after LLM setup)
 
 
 # ── Hub Evolve Meta-Tool ───────────────────────────────────────────────────────
@@ -255,26 +235,40 @@ async def execute_tool(name: str, args: dict) -> str:
 
 # ── Output Structure & Guardrails (Instructor & Pydantic) ────────────────────
 
-class SafeToolCallParameter(BaseModel):
-    """
-    Pydantic model to enforce safe parameters for CLI/System tools.
-    Blocks absolute file paths and shell injections.
-    """
-    @classmethod
-    def validate_safe_arg(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            # Block obvious absolute path attempts that might traverse to system dirs
-            if v.startswith("/") and len(v) > 1 and not v.startswith("/Users/apple/Documents/vikram_workspace"):
-                raise ValueError(f"Forbidden absolute path outside workspace: {v}")
-            # Block basic subshell injections
-            if "$(" in v or "`" in v or "&" in v or "|" in v:
-                raise ValueError(f"Potentially unsafe shell characters in argument: {v}")
-        return v
+BLOCKED_SHELL_PATTERNS = ["$(", "`", "&", "|", ";", "\n", ">>", ">", "<"]
+
+
+def _validate_safe_arg(v: Any) -> Any:
+    """Validate a single string argument for unsafe paths and shell injection."""
+    if isinstance(v, str):
+        # Block absolute paths outside the workspace (with traversal protection)
+        if v.startswith("/") and len(v) > 1:
+            resolved = os.path.realpath(v)  # Resolves ../ traversal
+            if not resolved.startswith(ALLOWED_WORKSPACE):
+                raise ValueError(f"Forbidden path outside workspace: {v} (resolves to {resolved})")
+        # Block shell injection patterns
+        for pattern in BLOCKED_SHELL_PATTERNS:
+            if pattern in v:
+                raise ValueError(f"Blocked unsafe pattern '{pattern}' in argument: {v[:100]}")
+    return v
+
+
+def _validate_recursive(value: Any) -> Any:
+    """Recursively validate all string values in nested structures."""
+    if isinstance(value, str):
+        _validate_safe_arg(value)
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _validate_recursive(v)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_recursive(item)
+    return value
+
 
 def validate_tool_arguments(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Validates arbitrary dictionary arguments against our safety rules."""
-    for k, v in args.items():
-        SafeToolCallParameter.validate_safe_arg(v)
+    """Validates arbitrary dictionary arguments against safety rules — recursively."""
+    _validate_recursive(args)
     return args
 
 
@@ -290,6 +284,9 @@ client = instructor.from_openai(
     raw_client,
     mode=instructor.Mode.JSON
 )
+
+# Initialize Layer 2 memory now that both vector_store and raw_client exist
+init_layer2(vector_store, raw_client, HUB_MODEL)
 
 async def call_llm(
     messages: List[Dict[str, Any]],
@@ -336,8 +333,9 @@ async def call_llm(
 
 # ── Conversation Engine (LangGraph) ──────────────────────────────────────────
 
+
 class AgentState(TypedDict):
-    messages: List[Dict[str, Any]]
+    messages: Annotated[List[Dict[str, Any]], operator.add]
     session_id: str
 
 
@@ -348,11 +346,12 @@ async def agent_node(state: AgentState) -> Dict[str, Any]:
     
     system_prompt = get_system_prompt()
     
-    # Retrieve relevant memories and inject them into the system prompt
+    # Retrieve tiered memory context (Layer 1 facts + Layer 2 preferences)
     last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
     if last_user_msg:
-        memory_context = get_user_memory(session_id, last_user_msg)
-        system_prompt += memory_context
+        memory_context = await build_memory_context(session_id, last_user_msg)
+        if memory_context:
+            system_prompt += memory_context
 
     tools = get_all_tools()
 
@@ -423,6 +422,9 @@ async def tools_node(state: AgentState) -> Dict[str, Any]:
 
         result = await execute_tool(tool_name, tool_args)
         
+        # Layer 1: Save structured facts from tool outputs
+        await process_tool_facts(session_id, tool_name, tool_args, result)
+        
         results.append({
             "role": "tool",
             "tool_call_id": tc["id"],
@@ -453,18 +455,11 @@ workflow.add_edge("tools", "agent")
 app_graph = workflow.compile(checkpointer=memory)
 
 
-async def agent_chat(session_id: str, user_message: str, history: List[Dict[str, Any]]) -> str:
+async def agent_chat(session_id: str, user_message: str) -> str:
     """
     Run the LangGraph workflow.
+    LangGraph's MemorySaver handles message history via thread_id.
     """
-    initial_messages = history + [{"role": "user", "content": user_message}]
-    
-    # Auto-extract explicit "remember this" or "always do X" instructions 
-    # and save them to the vector store
-    lower_msg = user_message.lower()
-    if "always " in lower_msg or "remember" in lower_msg or "prefer" in lower_msg:
-        # A simple heuristic; can be made smarter with LLM memory extraction
-        save_user_memory(session_id, user_message)
     
     # We pass recursion_limit equal to MAX_TOOL_ROUNDS + a little buffer
     config = {
@@ -473,10 +468,10 @@ async def agent_chat(session_id: str, user_message: str, history: List[Dict[str,
     }
     
     try:
-        # Run graph
-        # Note: we need to pass session_id into the state so the agent_node can use it for memory
+        # Run graph — only pass current user message.
+        # LangGraph's MemorySaver persists message history via thread_id.
         final_state = await app_graph.ainvoke({
-            "messages": initial_messages,
+            "messages": [{"role": "user", "content": user_message}],
             "session_id": session_id
         }, config=config)
         
@@ -503,19 +498,19 @@ async def agent_chat(session_id: str, user_message: str, history: List[Dict[str,
     if not messages:
         return "No response."
     last_message = messages[-1]
-    return last_message.get("content", "No text response generated.")
+    response_text = last_message.get("content", "No text response generated.")
+    
+    # Layer 2: Async LLM memory extraction (fire-and-forget, post-response)
+    asyncio.create_task(extract_and_save_memories(session_id, user_message, response_text))
+    
+    return response_text
 
 
-async def stream_chat(session_id: str, user_message: str, history: List[Dict[str, Any]]):
+async def stream_chat(session_id: str, user_message: str, context: Optional[Dict[str, Any]] = None):
     """
     Run LangGraph and yield Server-Sent Events (SSE) for real-time frontend streaming.
-    Yields chunks like: data: {"event": "model_stream", "content": "Hello"}
+    LangGraph's MemorySaver handles message history via thread_id.
     """
-    initial_messages = history + [{"role": "user", "content": user_message}]
-    
-    lower_msg = user_message.lower()
-    if "always " in lower_msg or "remember" in lower_msg or "prefer" in lower_msg:
-        save_user_memory(session_id, user_message)
 
     config = {
         "configurable": {"thread_id": session_id},
@@ -525,7 +520,7 @@ async def stream_chat(session_id: str, user_message: str, history: List[Dict[str
     try:
         # We use astream_events to catch granular internal events (tool starts, LLM tokens)
         async for event in app_graph.astream_events({
-            "messages": initial_messages,
+            "messages": [{"role": "user", "content": user_message}],
             "session_id": session_id
         }, config=config, version="v1"):
             
@@ -573,11 +568,8 @@ async def stream_chat(session_id: str, user_message: str, history: List[Dict[str
         messages = final_state.values.get("messages", [])
         if messages:
              content = messages[-1].get("content")
-             history.append({"role": "user", "content": user_message})
-             history.append({"role": "assistant", "content": content})
-             if len(history) > 40:
-                 history[:] = history[-30:]
-                 
+             log_chat_interaction(session_id, user_message, content, context)
+             
              payload = {"event": "done", "session_id": session_id}
              yield f"data: {json.dumps(payload)}\n\n"
 
@@ -589,9 +581,76 @@ async def stream_chat(session_id: str, user_message: str, history: List[Dict[str
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────
 
+def log_chat_interaction(session_id: str, prompt: str, response: str, context: Optional[Dict[str, Any]] = None):
+    try:
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        # Store in project_root/logs/YYYY-MM-DD/username.txt
+        log_dir = Path(__file__).parent.parent / "logs" / date_str
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        file_name = session_id
+        if context:
+            file_name = context.get("username") or context.get("user_id") or session_id
+            
+        # Clean up file_name in case of unexpected characters
+        file_name = str(file_name).replace("/", "_").replace("\\", "_")
+        log_file = log_dir / f"{file_name}.txt"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] Session: {session_id}\n")
+            if context:
+                f.write(f"Context: {context}\n")
+            f.write(f"User: {prompt}\n")
+            f.write(f"Hub: {response}\n")
+            f.write("-" * 80 + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write chat log: {e}")
+
+
 app = FastAPI(title="Hub Gateway v3", version="3.0.0")
 
-sessions: Dict[str, List[Dict[str, Any]]] = {}
+# ── API Key Auth ─────────────────────────────────────────────────────────────
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """Verify API key if HUB_API_KEY is set. Skip auth in dev mode."""
+    if not HUB_API_KEY:
+        return  # Auth disabled in dev mode
+    if api_key != HUB_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+# ── Redis Session Store ────────────────────────────────────────────────────────
+
+import redis.asyncio as aioredis
+
+_redis_client: Optional[aioredis.Redis] = None
+
+async def _get_redis() -> aioredis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
+
+async def get_session(session_id: str) -> List[Dict[str, Any]]:
+    """Get session history from Redis."""
+    try:
+        r = await _get_redis()
+        data = await r.get(f"hub:session:{session_id}")
+        if data:
+            return json.loads(data)
+    except Exception as e:
+        logger.warning(f"Redis session read failed, using empty: {e}")
+    return []
+
+async def save_session(session_id: str, history: List[Dict[str, Any]]):
+    """Save session history to Redis with TTL."""
+    try:
+        r = await _get_redis()
+        # Keep only last 30 messages to prevent unbounded growth
+        trimmed = history[-30:] if len(history) > 30 else history
+        await r.set(f"hub:session:{session_id}", json.dumps(trimmed), ex=SESSION_TTL_SECONDS)
+    except Exception as e:
+        logger.warning(f"Redis session write failed: {e}")
 
 
 class ChatRequest(BaseModel):
@@ -602,47 +661,62 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     output: str
     session_id: str
+    reports: Optional[List[str]] = None
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
 async def chat(req: ChatRequest):
     """Main entry point. Routes through LLM agent with tool calling."""
     session_id = req.session_id or str(uuid.uuid4())
 
-    if session_id not in sessions:
-        sessions[session_id] = []
-
-    history = sessions[session_id]
-
-    output = await agent_chat(session_id, req.prompt, history)
+    output = await agent_chat(session_id, req.prompt)
     
-    # If the output indicates it was interrupted, tell the user
-    # (Output from agent_chat natively might not yield a clean message during interrupt, 
-    # but we can detect state via the memory Checkpointer if needed. For now, we trust the output).
+    reports = None
+    if "[SEND_PORTFOLIO_REPORTS]" in output:
+        output = output.replace("[SEND_PORTFOLIO_REPORTS]", "Here are your portfolio analysis reports:").strip()
+        if not output:
+             output = "Here are your portfolio analysis reports:"
 
-    # Save to session history
+        import glob
+        rothchild_project = registry.projects.get("rothchild")
+        result_base = os.path.join(rothchild_project.root, "data", "result") if rothchild_project else ""
+        if result_base and os.path.exists(result_base):
+            subdirs = sorted([d for d in glob.glob(os.path.join(result_base, "*")) if os.path.isdir(d)])
+            if subdirs:
+                latest = subdirs[-1]
+                md1 = os.path.join(latest, "result.md")
+                md2 = os.path.join(latest, "result2.md")
+                reports = []
+                if os.path.exists(md1):
+                    with open(md1, "r", encoding="utf-8") as f:
+                        reports.append(f.read())
+                if os.path.exists(md2):
+                    with open(md2, "r", encoding="utf-8") as f:
+                        reports.append(f.read())
+
+    # Save to session history (for logging/portfolio reports)
+    history = await get_session(session_id)
     history.append({"role": "user", "content": req.prompt})
     history.append({"role": "assistant", "content": output})
+    await save_session(session_id, history)
 
-    # Trim history if too long
-    if len(history) > 40:
-        history[:] = history[-30:]
+    full_output = output
+    if reports:
+        for r in reports:
+            full_output += f"\n\n--- Report ---\n{r}"
 
-    return ChatResponse(output=output, session_id=session_id)
+    log_chat_interaction(session_id, req.prompt, full_output, req.context)
+
+    return ChatResponse(output=output, session_id=session_id, reports=reports)
 
 
-@app.post("/chat/stream")
+@app.post("/chat/stream", dependencies=[Depends(verify_api_key)])
 async def chat_stream(req: ChatRequest):
     """Event Stream (SSE) entry point for UI clients requiring real-time updates."""
     session_id = req.session_id or str(uuid.uuid4())
 
-    if session_id not in sessions:
-        sessions[session_id] = []
-
-    history = sessions[session_id]
-
     return StreamingResponse(
-        stream_chat(session_id, req.prompt, history),
+        stream_chat(session_id, req.prompt, req.context),
         media_type="text/event-stream"
     )
 
@@ -650,7 +724,7 @@ class ResumeRequest(BaseModel):
     approved: bool
 
 
-@app.post("/chat/resume/{thread_id}")
+@app.post("/chat/resume/{thread_id}", dependencies=[Depends(verify_api_key)])
 async def resume_chat(thread_id: str, req: ResumeRequest):
     """Resume a paused graph execution with an approval decision."""
     from langgraph.types import Command
@@ -742,7 +816,7 @@ async def list_projects():
     return {"projects": registry.project_summary()}
 
 
-@app.post("/discover")
+@app.post("/discover", dependencies=[Depends(verify_api_key)])
 async def discover(project_name: Optional[str] = None):
     """Re-run discovery for one or all projects."""
     results = registry.rediscover(project_name)
@@ -762,7 +836,7 @@ class RegisterRequest(BaseModel):
     discovery: Dict[str, Any] = {}
 
 
-@app.post("/register")
+@app.post("/register", dependencies=[Depends(verify_api_key)])
 async def register_project(req: RegisterRequest):
     """Register a new project at runtime."""
     config = {

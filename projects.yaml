@@ -74,6 +74,10 @@ projects:
           args:
             cadence: {type: string, enum: [daily, weekly, monthly, quarterly], description: "Report cadence"}
             dry-run: {type: boolean, flag: true, description: "Show what would run without executing"}
+        - name: rothchild_generate_packet
+          script: "generate_packet.py"
+          description: "Generate the full date-stamped portfolio analysis packet and ingest real external market data"
+          args: {}
         - name: rothchild_run_portfolio
           script: "run_sample.py"
           description: "Run advisor against a specific portfolio CSV"
@@ -99,3 +103,20 @@ projects:
       - name: rothchild_read_log
         description: "Read the latest run log to get analysis results"
         params: {}
+
+  antigravity:
+    type: cli
+    root: /Users/apple/Documents/vikram_workspace/mylanggraph/agenthub
+    venv: .venv
+    description: >
+      Antigravity wrapper to make code changes directly using the powerful Antigravity AI coding agent. 
+      Use for lightweight changes, scripts, single-file edits or quick refactors in any repository, avoiding the overhead of langgraph-poc.
+    discovery:
+      method: manual
+      commands:
+        - name: antigravity_run
+          script: "scripts/run_antigravity.py"
+          description: "Run antigravity agent on a local repository to solve a coding task."
+          args:
+            prompt: {type: string, required: true, description: "The natural language coding task for antigravity. Be descriptive."}
+            repo_path: {type: string, required: true, description: "Absolute path to the repository to change (e.g. /Users/apple/Documents/vikram_workspace/mylanggraph/agenthub or /Users/apple/Documents/vikram_workspace/mylanggraph/salesy)"}

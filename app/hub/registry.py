@@ -140,6 +140,7 @@ class Project:
 
     def build_env(self) -> Dict[str, str]:
         """Build environment dict for subprocess."""
+        from dotenv import dotenv_values
         env = os.environ.copy()
         venv_path = os.path.join(self.root, self.venv)
         venv_bin = os.path.join(venv_path, "bin")
@@ -147,12 +148,9 @@ class Project:
         env["VIRTUAL_ENV"] = venv_path
         env_file = os.path.join(self.root, ".env")
         if os.path.exists(env_file):
-            with open(env_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        k, _, v = line.partition("=")
-                        env.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            for k, v in dotenv_values(env_file).items():
+                if v is not None:
+                    env.setdefault(k, v)
         return env
 
 
@@ -202,7 +200,7 @@ class ProjectRegistry:
         })
         # Note: we handle it directly in execute_tool, so no _tool_meta entry is strictly required
         # but we'll add one so execute_tool knows how to route it.
-        self._tool_meta["check_task_status"] = {"type": "system_global"}
+        self._tool_meta["check_task_status"] = {"type": "system_global", "project_name": "hub"}
 
         logger.info(f"Registry loaded: {len(self.projects)} projects, {len(self.tools)} tools")
 
@@ -319,10 +317,11 @@ When a user mentions stocks or holdings (e.g. "I have 10 shares of HDFC"), follo
 1. Gather holdings: Ask for symbol, quantity, avg cost, and exchange if not provided.
 2. Create portfolio: Use `rothchild_create_portfolio` to generate a CSV from the holdings
 3. Run analysis: Use `rothchild_run_portfolio` with the generated CSV path
-4. Read results: Use `rothchild_read_log` to get the analysis output
+4. Read results: When the analysis is complete, ALWAYS reply EXACTLY with `[SEND_PORTFOLIO_REPORTS]` and nothing else. Do not attempt to summarize the results yourself. The backend will automatically fetch the exact markdown files and send them.
 
 If user provides a CSV file path directly, skip to step 3.
-If user just says "run analysis" without specifying holdings, use `rothchild_run` (uses default sample portfolio).
+If the user asks to generate the full portfolio analysis, fetch latest data, or asks why dates are missing, use `rothchild_generate_packet`. When it finishes, reply EXACTLY with `[SEND_PORTFOLIO_REPORTS]`.
+If user just says "run preview analysis" without specifying holdings, use `rothchild_run` (uses default sample portfolio) and then reply exactly with `[SEND_PORTFOLIO_REPORTS]`.
 """)
 
         return "\n".join(sections)
@@ -359,18 +358,21 @@ If user just says "run analysis" without specifying holdings, use `rothchild_run
         if not meta:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
-        project_name = meta["project_name"]
+        # Handle strictly global hub tools first before needing a project
+        if meta.get("type") == "system_global":
+            if tool_name == "check_task_status":
+                return await self._execute_check_task_status(args)
+            return json.dumps({"error": f"Unknown global tool: {tool_name}"})
+
+        project_name = meta.get("project_name")
+        if not project_name:
+            return json.dumps({"error": f"Tool missing project_name metadata: {tool_name}"})
+
         project = self.projects.get(project_name)
         if not project:
             return json.dumps({"error": f"Project not found: {project_name}"})
 
         try:
-            # Handle strictly global hub tools
-            if meta.get("type") == "system_global":
-                if tool_name == "check_task_status":
-                    return await self._execute_check_task_status(args)
-                return json.dumps({"error": f"Unknown global tool: {tool_name}"})
-
             # Custom tools need specific handlers
             if meta.get("type") == "custom":
                 return await self._execute_custom(tool_name, args, project, meta)
